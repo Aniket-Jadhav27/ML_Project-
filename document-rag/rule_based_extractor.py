@@ -53,31 +53,53 @@ class ExtractedTable:
     cells: List[CellPositionalData] = field(default_factory=list)
     raw_rows: List[List[str]] = field(default_factory=list)
 
+    @staticmethod
+    def _clean_cell(text: str) -> str:
+        """Normalize whitespace inside a cell: collapse newlines and extra spaces."""
+        if not text:
+            return ""
+        return " ".join(text.split())
+
+    def _clean_headers(self) -> List[str]:
+        """Return clean, deduplicated column header names safe for use as JSON keys."""
+        seen: Dict[str, int] = {}
+        result = []
+        for i, h in enumerate(self.raw_rows[0] if self.raw_rows else []):
+            clean = self._clean_cell(h) or f"Column_{i}"
+            if clean in seen:
+                seen[clean] += 1
+                clean = f"{clean}_{seen[clean]}"
+            else:
+                seen[clean] = 0
+            result.append(clean)
+        return result
+
     def to_markdown(self) -> str:
-        """Formats the table into standard GitHub-flavored Markdown."""
+        """Formats the table into valid GitHub-flavored Markdown.
+        Newlines inside cells are collapsed so pipe separators stay on one line."""
         if not self.raw_rows:
             return ""
+        col_headers = self._clean_headers()
         lines = []
-        headers = [c if c else f"Col_{i}" for i, c in enumerate(self.raw_rows[0])]
-        lines.append("| " + " | ".join(headers) + " |")
-        lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
-
+        lines.append("| " + " | ".join(col_headers) + " |")
+        lines.append("| " + " | ".join(["---"] * len(col_headers)) + " |")
         for row in self.raw_rows[1:]:
-            padded_row = [(c if c else "") for c in row]
-            while len(padded_row) < len(headers):
-                padded_row.append("")
-            lines.append("| " + " | ".join(padded_row[:len(headers)]) + " |")
-
+            padded = [(self._clean_cell(c) if c else "") for c in row]
+            while len(padded) < len(col_headers):
+                padded.append("")
+            lines.append("| " + " | ".join(padded[:len(col_headers)]) + " |")
         return "\n".join(lines)
 
     def to_positional_text(self) -> str:
-        """Generates explicit row, column, and cell coordinate annotations for LLM grounding."""
+        """Human-readable, LLM-friendly text with Row/Col labels and coordinates."""
         box_str = (
             f"x0={self.bbox[0]:.1f}, top={self.bbox[1]:.1f}, "
             f"x1={self.bbox[2]:.1f}, bottom={self.bbox[3]:.1f}"
         )
+        col_headers = self._clean_headers()
         lines = [
-            f"[TABLE {self.table_id} | Page {self.page} | Dimensions: {self.num_rows} Rows x {self.num_cols} Cols | BBox: ({box_str})]"
+            f"[TABLE {self.table_id} | Page {self.page} | "
+            f"{self.num_rows} Rows x {self.num_cols} Cols | BBox: ({box_str})]",
         ]
 
         md = self.to_markdown()
@@ -85,32 +107,106 @@ class ExtractedTable:
             lines.append(md)
             lines.append("")
 
-        lines.append("--- Cell Position Mapping ---")
+        lines.append("--- Cell-Level Positional Index ---")
         for cell in self.cells:
-            cell_tag = "Header" if cell.is_header else "Data"
+            cell_tag = "HEADER" if cell.is_header else "DATA"
+            col_name = col_headers[cell.col_idx] if cell.col_idx < len(col_headers) else f"Col_{cell.col_idx}"
             coord_str = ""
             if cell.bbox:
-                coord_str = f" @ [x0={cell.bbox[0]:.1f}, top={cell.bbox[1]:.1f}, x1={cell.bbox[2]:.1f}, bottom={cell.bbox[3]:.1f}]"
+                coord_str = (
+                    f" [bbox: x0={cell.bbox[0]:.1f}, top={cell.bbox[1]:.1f},"
+                    f" x1={cell.bbox[2]:.1f}, bottom={cell.bbox[3]:.1f}]"
+                )
             lines.append(
-                f"• Row {cell.row_idx}, Col {cell.col_idx} ({cell_tag}){coord_str}: {cell.text}"
+                f"  Row {cell.row_idx} | Col {cell.col_idx} \"{col_name}\" ({cell_tag}){coord_str}: "
+                f"{self._clean_cell(cell.text)}"
             )
-
         return "\n".join(lines)
 
     def to_json_dict(self) -> Dict[str, Any]:
-        """Serializes the table into a clean JSON object with row records and cell matrices."""
-        row_objects = []
-        headers = self.headers
-        for r_idx in range(1, len(self.raw_rows)):
-            row = self.raw_rows[r_idx]
-            row_dict = {}
-            for c_idx, cell_value in enumerate(row):
-                col_name = headers[c_idx] if c_idx < len(headers) and headers[c_idx] else f"Column_{c_idx}"
-                row_dict[col_name] = cell_value
-            row_objects.append({
+        """
+        Fully-structured JSON for LLM consumption:
+        - 'column_headers': clean list of column names (index = col position)
+        - 'rows': list of objects; each row has row_index + per-column keyed values
+                  PLUS a 'positional' matrix with {col_index, col_name, value, bbox}
+        - 'cells': flat array of every cell with row, col, name, value, bbox, type
+        - 'markdown': valid single-line-per-row markdown
+        - 'llm_context': a plain-English table summary for the LLM
+        """
+        col_headers = self._clean_headers()
+
+        # Build structured rows
+        structured_rows = []
+        for r_idx, raw_row in enumerate(self.raw_rows):
+            is_header_row = (r_idx == 0)
+            row_type = "header" if is_header_row else "data"
+
+            # Build a named-column dict (easy lookup by name)
+            named = {}
+            for c_idx, cell_val in enumerate(raw_row):
+                col_name = col_headers[c_idx] if c_idx < len(col_headers) else f"Column_{c_idx}"
+                named[col_name] = self._clean_cell(cell_val) if cell_val else ""
+
+            # Build positional list (easy lookup by index)
+            positional = []
+            for c_idx, cell_val in enumerate(raw_row):
+                col_name = col_headers[c_idx] if c_idx < len(col_headers) else f"Column_{c_idx}"
+                # Try to get bbox from cells list
+                bbox_val = None
+                for cell in self.cells:
+                    if cell.row_idx == r_idx and cell.col_idx == c_idx and cell.bbox:
+                        bbox_val = {
+                            "x0": round(cell.bbox[0], 2),
+                            "top": round(cell.bbox[1], 2),
+                            "x1": round(cell.bbox[2], 2),
+                            "bottom": round(cell.bbox[3], 2),
+                        }
+                        break
+                positional.append({
+                    "col_index": c_idx,
+                    "col_name": col_name,
+                    "value": self._clean_cell(cell_val) if cell_val else "",
+                    "bbox": bbox_val,
+                })
+
+            structured_rows.append({
                 "row_index": r_idx,
-                "data": row_dict
+                "row_type": row_type,
+                "named_columns": named,
+                "positional": positional,
             })
+
+        # Build a flat cells array
+        flat_cells = []
+        for cell in self.cells:
+            col_name = col_headers[cell.col_idx] if cell.col_idx < len(col_headers) else f"Column_{cell.col_idx}"
+            flat_cells.append({
+                "row_index": cell.row_idx,
+                "col_index": cell.col_idx,
+                "col_name": col_name,
+                "value": self._clean_cell(cell.text),
+                "is_header": cell.is_header,
+                "bbox": {
+                    "x0": round(cell.bbox[0], 2),
+                    "top": round(cell.bbox[1], 2),
+                    "x1": round(cell.bbox[2], 2),
+                    "bottom": round(cell.bbox[3], 2),
+                } if cell.bbox else None,
+            })
+
+        # Build an LLM-readable plain-English summary of the table
+        llm_lines = [
+            f"Table {self.table_id} on Page {self.page} has {self.num_rows} rows"
+            f" and {self.num_cols} columns.",
+            f"Column headers (left to right): {', '.join(col_headers)}.",
+        ]
+        for row in structured_rows[1:]:  # skip header row
+            row_parts = []
+            for col_name, val in row["named_columns"].items():
+                if val:
+                    row_parts.append(f"{col_name} = {val}")
+            if row_parts:
+                llm_lines.append(f"  Row {row['row_index']}: " + " | ".join(row_parts))
 
         return {
             "table_id": self.table_id,
@@ -125,10 +221,11 @@ class ExtractedTable:
                 "rows": self.num_rows,
                 "columns": self.num_cols,
             },
-            "headers": self.headers,
-            "rows": row_objects,
-            "cells": [c.to_dict() for c in self.cells],
+            "column_headers": col_headers,
+            "rows": structured_rows,
+            "cells": flat_cells,
             "markdown": self.to_markdown(),
+            "llm_context": "\n".join(llm_lines),
         }
 
     def to_dict(self) -> Dict[str, Any]:
@@ -488,13 +585,18 @@ class RuleBasedExtractor:
     def chunk_from_json(
         self,
         document_json: Dict[str, Any],
-        max_chunk_size: int = 1500,
-        overlap: int = 200,
+        max_chunk_size: int = 2000,
+        overlap: int = 150,
     ) -> List[Dict[str, Any]]:
         """
         Step 2: Converts the JSON-formatted data into vector database chunks for ChromaDB.
-        - Tables are emitted as structured JSON objects with cell mappings and markdown.
-        - Body paragraphs are emitted with structured JSON metadata.
+
+        Table chunks contain THREE representations so the LLM can always answer correctly:
+          1. llm_context  — plain English sentence per row: "Row 2: Col_A = val | Col_B = val"
+          2. markdown     — clean pipe-table (one row per line, no embedded newlines)
+          3. positional   — Row N | Col M "ColName" (HEADER|DATA) [bbox]: value
+
+        Body chunks carry a header_context prefix so the LLM knows which section they belong to.
         """
         chunks: List[Dict[str, Any]] = []
         chunk_idx = 0
@@ -502,64 +604,101 @@ class RuleBasedExtractor:
 
         for page in document_json.get("pages", []):
             p_num = page.get("page_number", 1)
-            header_text = page.get("header", {}).get("text", "") if page.get("header") else ""
-            footer_text = page.get("footer", {}).get("text", "") if page.get("footer") else ""
+            header_text = (page.get("header") or {}).get("text", "")
+            footer_text = (page.get("footer") or {}).get("text", "")
 
-            # 1. Chunk Each Table from the JSON Schema
+            # ── 1. TABLE CHUNKS ─────────────────────────────────────────────────
             for tbl in page.get("tables", []):
                 table_id = tbl.get("table_id", 1)
                 dims = tbl.get("dimensions", {})
                 num_rows = dims.get("rows", 0)
                 num_cols = dims.get("columns", 0)
+                col_headers = tbl.get("column_headers", tbl.get("headers", []))
 
-                # Build rich JSON text representation for the Vector DB
-                json_payload = {
-                    "format": "JSON_TABLE_SCHEMA",
-                    "table_id": table_id,
-                    "page": p_num,
-                    "dimensions": dims,
-                    "headers": tbl.get("headers", []),
-                    "rows": tbl.get("rows", []),
-                }
+                # ── Section A: LLM plain-English context ──────────────────────
+                llm_ctx = tbl.get("llm_context", "")
 
-                # Hybrid text: JSON schema + Positional mapping for LLM grounding
-                table_content_parts = [
-                    f"[JSON TABLE SCHEMA - Table {table_id} | Page {p_num} | {num_rows} Rows x {num_cols} Cols]",
-                    json.dumps(json_payload, indent=2, ensure_ascii=False),
-                    "",
-                    "--- Markdown View ---",
-                    tbl.get("markdown", ""),
-                    "",
-                    "--- Positional Cells ---",
+                # ── Section B: Clean Markdown ─────────────────────────────────
+                markdown = tbl.get("markdown", "")
+
+                # ── Section C: Structured positional index ────────────────────
+                positional_lines = [
+                    f"[POSITIONAL CELL INDEX — Table {table_id} | Page {p_num}]",
                 ]
-
                 for cell in tbl.get("cells", []):
-                    c_tag = "Header" if cell.get("is_header") else "Data"
+                    cell_type = "HEADER" if cell.get("is_header") else "DATA"
+                    col_name = cell.get("col_name", f"Col_{cell.get('col_index', '?')}")
                     bbox = cell.get("bbox")
-                    b_str = f" @ {bbox}" if bbox else ""
-                    table_content_parts.append(
-                        f"• Row {cell.get('row')}, Col {cell.get('col')} ({c_tag}){b_str}: {cell.get('text')}"
+                    bbox_str = ""
+                    if bbox:
+                        bbox_str = (
+                            f" [x0={bbox.get('x0')}, top={bbox.get('top')},"
+                            f" x1={bbox.get('x1')}, bottom={bbox.get('bottom')}]"
+                        )
+                    positional_lines.append(
+                        f"  Row {cell.get('row_index')} | Col {cell.get('col_index')}"
+                        f" \"{col_name}\" ({cell_type}){bbox_str}: {cell.get('value', '')}"
                     )
 
-                chunk_text = "\n".join(table_content_parts)
+                # ── Section D: Row-by-row named JSON for structured lookups ──
+                row_json_lines = [
+                    f"[ROW-BY-ROW STRUCTURED DATA — Table {table_id} | Page {p_num}]",
+                    f"Column order (left→right): {', '.join(col_headers)}",
+                ]
+                for row in tbl.get("rows", []):
+                    if row.get("row_type") == "header":
+                        continue
+                    r_idx = row.get("row_index")
+                    named = row.get("named_columns", {})
+                    # Emit as "Row N | ColA: val | ColB: val | ..."
+                    pairs = " | ".join(
+                        f"{k}: {v}" for k, v in named.items() if v
+                    )
+                    if pairs:
+                        row_json_lines.append(f"  Row {r_idx}: {pairs}")
 
-                chunks.append(
-                    {
-                        "chunk_id": chunk_idx,
-                        "page": p_num,
-                        "chunk_type": "table",
-                        "table_id": table_id,
-                        "num_rows": num_rows,
-                        "num_cols": num_cols,
-                        "text": chunk_text,
-                        "json_data": json.dumps(json_payload),
-                        "start": 0,
-                        "end": len(chunk_text),
-                    }
-                )
+                # Assemble all sections into the chunk text
+                chunk_text = "\n".join([
+                    f"=== TABLE {table_id} | Page {p_num} | {num_rows} rows × {num_cols} cols ===",
+                    "",
+                    "── Plain-English Summary ──",
+                    llm_ctx,
+                    "",
+                    "── Markdown Table ──",
+                    markdown,
+                    "",
+                    "\n".join(row_json_lines),
+                    "",
+                    "\n".join(positional_lines),
+                ])
+
+                # Compact JSON payload stored separately for structured retrieval
+                json_payload = {
+                    "format": "STRUCTURED_TABLE",
+                    "table_id": table_id,
+                    "page": p_num,
+                    "source": doc_name,
+                    "dimensions": dims,
+                    "column_headers": col_headers,
+                    "rows": tbl.get("rows", []),
+                    "bounding_box": tbl.get("bounding_box"),
+                }
+
+                chunks.append({
+                    "chunk_id": chunk_idx,
+                    "page": p_num,
+                    "chunk_type": "table",
+                    "table_id": table_id,
+                    "num_rows": num_rows,
+                    "num_cols": num_cols,
+                    "text": chunk_text,
+                    "json_data": json.dumps(json_payload, ensure_ascii=False),
+                    "start": 0,
+                    "end": len(chunk_text),
+                })
                 chunk_idx += 1
 
-            # 2. Chunk Body Text from the JSON Schema
+            # ── 2. BODY TEXT CHUNKS ──────────────────────────────────────────
             body = page.get("body_text", "")
             if body.strip():
                 start = 0
@@ -568,30 +707,30 @@ class RuleBasedExtractor:
                     chunk_str = body[start:end].strip()
 
                     if chunk_str:
+                        # Prefix with page header for context
+                        header_prefix = f"[Section: {header_text}]\n" if header_text else f"[Page {p_num}]\n"
+                        full_chunk = f"{header_prefix}{chunk_str}"
+
                         body_json = {
-                            "format": "JSON_BODY_TEXT",
+                            "format": "BODY_TEXT",
                             "page": p_num,
-                            "header_context": header_text if header_text else None,
+                            "source": doc_name,
+                            "section_header": header_text or None,
                             "content": chunk_str,
                         }
 
-                        header_prefix = f"[{header_text}]\n" if header_text else ""
-                        full_chunk = f"{header_prefix}{chunk_str}\n\n[Structured JSON]: {json.dumps(body_json, ensure_ascii=False)}"
-
-                        chunks.append(
-                            {
-                                "chunk_id": chunk_idx,
-                                "page": p_num,
-                                "chunk_type": "body",
-                                "table_id": 0,
-                                "num_rows": 0,
-                                "num_cols": 0,
-                                "text": full_chunk,
-                                "json_data": json.dumps(body_json),
-                                "start": start,
-                                "end": end,
-                            }
-                        )
+                        chunks.append({
+                            "chunk_id": chunk_idx,
+                            "page": p_num,
+                            "chunk_type": "body",
+                            "table_id": 0,
+                            "num_rows": 0,
+                            "num_cols": 0,
+                            "text": full_chunk,
+                            "json_data": json.dumps(body_json, ensure_ascii=False),
+                            "start": start,
+                            "end": end,
+                        })
                         chunk_idx += 1
 
                     if end == len(body):
