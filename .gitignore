@@ -1,0 +1,72 @@
+# ============================================================
+# DocRAG AI — Root .gitignore
+# ============================================================
+
+# ─── IDE & OS ────────────────────────────────────────────────
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Environment / Secrets (NEVER commit these) ─────────────
+.env
+.env.*
+!.env.example
+*.env
+
+# ─── Java / Spring Boot (backend/) ──────────────────────────
+backend/target/
+backend/.mvn/wrapper/maven-wrapper.jar
+backend/**/*.class
+backend/**/*.jar
+!backend/src/**
+*.log
+
+# ─── Python / FastAPI (document-rag/) ───────────────────────
+document-rag/__pycache__/
+document-rag/**/__pycache__/
+document-rag/*.pyc
+document-rag/**/*.pyc
+document-rag/.venv/
+document-rag/venv/
+document-rag/env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# ─── ChromaDB Vector Store (runtime-generated, can be large) ─
+document-rag/chroma_db/
+
+# ─── Uploaded Documents & Extracted Data (user data, private)─
+# These contain user-uploaded PDFs and extracted JSON — do NOT push
+document-rag/data/*.pdf
+document-rag/data/*_extracted.json
+document-rag/data/user_*/
+# Allow sample/test files explicitly if you add them
+!document-rag/data/document.pdf
+!document-rag/data/mgnrega_sample_report.pdf
+!document-rag/data/document.txt
+
+# ─── React / Node (frontend/) ───────────────────────────────
+frontend/node_modules/
+frontend/dist/
+frontend/.parcel-cache/
+frontend/coverage/
+frontend/*.local
+
+# ─── Maven wrapper JAR ──────────────────────────────────────
+backend/.mvn/wrapper/maven-wrapper.jar
+
+# ─── Logs ───────────────────────────────────────────────────
+logs/
+*.log
+*.log.*
+
+# ─── Temporary / Runtime files ──────────────────────────────
+*.tmp
+*.swp
+*.swo
+~$*

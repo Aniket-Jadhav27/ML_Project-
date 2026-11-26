@@ -1,0 +1,28 @@
+# ─── Java / Spring Boot git-ignore (backend/) ───────────────
+
+# Maven build output
+target/
+!target/.gitkeep
+
+# Java compiled files
+*.class
+*.jar
+!.mvn/wrapper/maven-wrapper.jar
+
+# Local properties with real credentials (git-ignored)
+src/main/resources/application-local.properties
+
+# IDE
+.idea/
+*.iml
+.classpath
+.project
+.settings/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
