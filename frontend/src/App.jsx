@@ -109,7 +109,9 @@ export default function App() {
             </Alert>
           )}
 
-          {currentTab === 'chat' && <ChatView user={user} onRequireAuth={() => setAuthOpen(true)} />}
+          <Box sx={{ display: currentTab === 'chat' ? 'contents' : 'none' }}>
+            <ChatView user={user} onRequireAuth={() => setAuthOpen(true)} />
+          </Box>
           {currentTab === 'chunks' && (
             <ChunkDataGrid
               key={`${user?.username || 'guest'}-${uploadCounter}`}

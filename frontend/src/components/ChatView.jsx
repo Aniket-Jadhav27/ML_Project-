@@ -43,7 +43,7 @@ export default function ChatView({ user, onRequireAuth }) {
 
   useEffect(() => {
     setMessages([DEFAULT_WELCOME_MESSAGE]);
-  }, [user]);
+  }, [user?.username]);
 
   const handleClearChat = () => {
     setMessages([DEFAULT_WELCOME_MESSAGE]);
