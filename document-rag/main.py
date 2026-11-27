@@ -1,17 +1,74 @@
+import os
 from pathlib import Path
 import sys
+from typing import Optional
 
 import chromadb
-import ollama
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 
 from rule_based_extractor import RuleBasedExtractor, ExtractedPageStructure
 
 BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
 CHROMA_PATH = BASE_DIR / "chroma_db"
 DATA_DIR = BASE_DIR / "data"
 
-EMBED_MODEL = "nomic-embed-text"
-LLM_MODEL = "llama3.2:3b"
+EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001")
+LLM_MODEL = os.getenv("GEMINI_LLM_MODEL", "gemini-3.5-flash-lite")
+FALLBACK_LLM_MODELS = [
+    m.strip()
+    for m in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-3.1-flash-lite,gemini-3.8-flash").split(",")
+    if m.strip()
+]
+
+_genai_client: Optional[genai.Client] = None
+
+
+def get_genai_client() -> genai.Client:
+    """Lazily initialize the Gemini API client using GEMINI_API_KEY."""
+    global _genai_client
+    if _genai_client is None:
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is not set in environment or document-rag/.env")
+        _genai_client = genai.Client(api_key=api_key)
+    return _genai_client
+
+
+def generate_rag_answer(context: str, question: str) -> str:
+    """Generate an answer using Gemini with automatic fallback on transient 503/429 errors."""
+    system_instruction = (
+        "Answer using only the supplied document excerpts. "
+        "When answering questions about tables, identify the exact row, column, and cell value coordinates if applicable. "
+        "Do not invent facts. If the evidence is insufficient, say so. "
+        "Cite supporting chunk IDs, table IDs, and page numbers."
+    )
+    prompt = f"DOCUMENT EXCERPTS:\n{context}\n\nQUESTION: {question}"
+    models_to_try = [LLM_MODEL] + [m for m in FALLBACK_LLM_MODELS if m != LLM_MODEL]
+    last_error: Optional[Exception] = None
+
+    for model_name in models_to_try:
+        try:
+            interaction = get_genai_client().interactions.create(
+                model=model_name,
+                input=prompt,
+                system_instruction=system_instruction,
+                generation_config={"temperature": 0},
+                store=False,
+            )
+            return interaction.output_text or ""
+        except Exception as exc:
+            last_error = exc
+            err_str = str(exc).lower()
+            if any(code in err_str for code in ("503", "429", "service_unavailable", "high demand", "resource_exhausted")):
+                continue
+            raise
+
+    raise RuntimeError(f"All Gemini models failed: {last_error}")
+
 
 client = chromadb.PersistentClient(path=str(CHROMA_PATH))
 collection = client.get_or_create_collection(
@@ -34,11 +91,14 @@ def chunk_document(pages_struct):
 
 
 def embed(texts):
-    result = ollama.embed(
+    if not texts:
+        return []
+    result = get_genai_client().models.embed_content(
         model=EMBED_MODEL,
-        input=texts,
+        contents=texts,
+        config=types.EmbedContentConfig(output_dimensionality=768),
     )
-    return result["embeddings"]
+    return [emb.values for emb in result.embeddings]
 
 
 def resolve_document_path(target_path=None) -> Path | None:
@@ -173,31 +233,8 @@ def ask_question(question):
 
     context = "\n\n".join(context_parts)
 
-    response = ollama.chat(
-        model=LLM_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Answer using only the supplied document excerpts. "
-                    "When answering questions about tables, identify the exact row, column, and cell value coordinates if applicable. "
-                    "Do not invent facts. If the evidence is insufficient, say so. "
-                    "Cite supporting chunk IDs, table IDs, and page numbers."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"DOCUMENT EXCERPTS:\n{context}\n\n"
-                    f"QUESTION: {question}"
-                ),
-            },
-        ],
-        options={"temperature": 0, "num_ctx": 4096},
-    )
-
     print("\nAnswer:")
-    print(response["message"]["content"])
+    print(generate_rag_answer(context, question))
 
     print("\nRetrieved chunks:")
     for metadata, distance in zip(

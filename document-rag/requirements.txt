@@ -1,4 +1,8 @@
 chromadb
-ollama
+google-genai>=2.30.1
+python-dotenv
+fastapi
+uvicorn
+python-multipart
 pypdf
 pdfplumber
